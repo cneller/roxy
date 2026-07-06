@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -223,6 +225,78 @@ func TestNonWebSocketRequestPreservesHeaders(t *testing.T) {
 		t.Errorf("non-upgrade request: Sec-WebSocket-Extensions = %q; "+
 			"want %q (regular HTTP headers should pass through unmodified)",
 			receivedExtensions, "permessage-deflate")
+	}
+}
+
+// TestWebSocketForwardsSubprotocolUpstream verifies the proxy forwards the
+// client's Sec-WebSocket-Protocol to the upstream dial AND echoes the
+// negotiated subprotocol back to the client. This mirrors Vite's HMR socket,
+// which only completes the upgrade (and emits {"type":"connected"}) when the
+// client offers the "vite-hmr" subprotocol. Without forwarding, the upstream
+// tears the handshake down ("unexpected EOF") and no frames tunnel — the exact
+// hub.roxy.test HMR failure this fixes.
+func TestWebSocketForwardsSubprotocolUpstream(t *testing.T) {
+	upgrader := websocket.Upgrader{
+		CheckOrigin:  func(*http.Request) bool { return true },
+		Subprotocols: []string{"vite-hmr"},
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Mimic Vite: refuse the upgrade unless the HMR subprotocol was offered.
+		if !slices.Contains(websocket.Subprotocols(r), "vite-hmr") {
+			http.Error(w, "missing vite-hmr subprotocol", http.StatusBadRequest)
+			return
+		}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		// Vite emits this immediately on the negotiated HMR socket.
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"connected"}`)); err != nil {
+			return
+		}
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer upstream.Close()
+
+	srv := &Server{
+		routes: []Route{{Domain: "app.test", Port: parsePort(t, upstream.URL), Type: "http"}},
+	}
+	proxyServer := httptest.NewServer(http.HandlerFunc(srv.handleHTTP))
+	defer proxyServer.Close()
+
+	dialer := websocket.Dialer{Subprotocols: []string{"vite-hmr"}}
+	wsURL := "ws" + strings.TrimPrefix(proxyServer.URL, "http") + "/"
+	conn, resp, err := dialer.Dial(wsURL, http.Header{"Host": {"app.test"}})
+	if err != nil {
+		t.Fatalf("dial through proxy: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	defer func() { _ = resp.Body.Close() }()
+
+	// The proxy must echo the negotiated subprotocol back to the client.
+	if got := resp.Header.Get("Sec-WebSocket-Protocol"); got != "vite-hmr" {
+		t.Errorf("client negotiated subprotocol = %q; want %q (proxy must echo it back)", got, "vite-hmr")
+	}
+	if got := conn.Subprotocol(); got != "vite-hmr" {
+		t.Errorf("conn.Subprotocol() = %q; want %q", got, "vite-hmr")
+	}
+
+	// The upstream's HMR frame must tunnel back through the proxy. Pre-fix, the
+	// upstream refused the (subprotocol-less) handshake, so this read fails.
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_, msg, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("reading upstream HMR frame through proxy: %v "+
+			"(subprotocol not forwarded → upstream refused the handshake)", err)
+	}
+	if string(msg) != `{"type":"connected"}` {
+		t.Errorf("tunneled frame = %q; want %q", msg, `{"type":"connected"}`)
 	}
 }
 

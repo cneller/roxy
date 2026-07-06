@@ -327,9 +327,18 @@ var notFoundTmpl = template.Must(template.New("notfound").Parse(`<!DOCTYPE html>
 // is fully isolated — the RSV1 frame corruption that occurs when
 // httputil.ReverseProxy passes compressed frames through is impossible.
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, upstream, host string) {
-	// Accept the client's WebSocket upgrade
+	// The websocket subprotocol(s) the client requested (e.g. Vite's
+	// "vite-hmr"). These must be BOTH echoed back to the client on the accept
+	// AND carried to the upstream dial: protocol-gated servers like Vite's HMR
+	// socket only complete the upgrade — and only emit frames — when the
+	// negotiated subprotocol is present, so dropping it opens the client
+	// handshake but starves the tunnel (a 101 with zero upstream frames).
+	clientSubprotocols := websocket.Subprotocols(r)
+
+	// Accept the client's WebSocket upgrade, echoing the negotiated subprotocol.
 	upgrader := websocket.Upgrader{
-		CheckOrigin: func(*http.Request) bool { return true },
+		CheckOrigin:  func(*http.Request) bool { return true },
+		Subprotocols: clientSubprotocols,
 	}
 	clientConn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -338,8 +347,9 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, upstrea
 	}
 	defer func() { _ = clientConn.Close() }()
 
-	// Dial the upstream as a fresh WebSocket connection (no compression)
-	dialer := websocket.Dialer{}
+	// Dial the upstream as a fresh WebSocket connection (no compression),
+	// forwarding the client's subprotocols so protocol-gated upstreams accept it.
+	dialer := websocket.Dialer{Subprotocols: clientSubprotocols}
 	reqHeader := http.Header{
 		"Host":             {host},
 		"X-Forwarded-Host": {host},
