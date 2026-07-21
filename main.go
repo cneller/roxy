@@ -197,7 +197,7 @@ func runCommand(args []string) error {
 			return err
 		}
 		if cfg == nil {
-			die("no roxy.json found in current directory")
+			die("no roxy.json or roxy.yaml found in current directory")
 		}
 		return cmd.RunAll(cfg, opts)
 	}
@@ -219,7 +219,7 @@ func runCommand(args []string) error {
 			return err
 		}
 		if cfg == nil {
-			die(fmt.Sprintf("unknown service %q (no roxy.json found)\n\n%s", opts.Command, runUsage))
+			die(fmt.Sprintf("unknown service %q (no roxy.json or roxy.yaml found)\n\n%s", opts.Command, runUsage))
 		}
 		if svc, ok := cfg.Services[opts.Command]; ok {
 			return cmd.RunService(opts.Command, svc, opts)
@@ -228,7 +228,7 @@ func runCommand(args []string) error {
 		for name := range cfg.Services {
 			names = append(names, name)
 		}
-		die(fmt.Sprintf("unknown service %q in roxy.json (available: %s)", opts.Command, strings.Join(names, ", ")))
+		die(fmt.Sprintf("unknown service %q in manifest (available: %s)", opts.Command, strings.Join(names, ", ")))
 	}
 
 	return cmd.Run(opts)
