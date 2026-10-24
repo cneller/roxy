@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io"
@@ -98,6 +99,26 @@ func New(opts Options) *Server {
 
 // Run starts the proxy + DNS server, watches for route changes, and blocks until signaled.
 func (s *Server) Run() error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return s.RunContext(ctx, nil)
+}
+
+// RunContext binds HTTP before publishing ownership through ready.
+func (s *Server) RunContext(ctx context.Context, ready func() error) error {
+	ln, err := net.Listen("tcp", s.httpAddr)
+	if err != nil {
+		return fmt.Errorf("http server: %w", err)
+	}
+	defer ln.Close()
+	s.httpServer = &http.Server{Addr: ln.Addr().String(), Handler: http.HandlerFunc(s.handleHTTP)}
+	if ready != nil {
+		if err := ready(); err != nil {
+			return err
+		}
+	}
+	defer s.shutdown()
+
 	if err := s.loadRoutes(); err != nil {
 		log.Printf("warning: failed to load routes: %v", err)
 	}
@@ -108,18 +129,11 @@ func (s *Server) Run() error {
 		log.Printf("warning: failed to start DNS server: %v (is port %d in use?)", err, s.dnsPort)
 	}
 
-	// Start HTTP server
 	mux := http.HandlerFunc(s.handleHTTP)
-	s.httpServer = &http.Server{
-		Addr:    s.httpAddr,
-		Handler: mux,
-	}
-
 	errCh := make(chan error, 2)
-
 	go func() {
-		log.Printf("proxy listening on http://0.0.0.0%s", s.httpAddr)
-		if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Printf("proxy listening on http://%s", ln.Addr())
+		if err := s.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
 			errCh <- fmt.Errorf("http server: %w", err)
 		}
 	}()
@@ -151,27 +165,25 @@ func (s *Server) Run() error {
 		}
 	}
 
+	if dnsServer != nil {
+		defer dnsServer.Stop()
+	}
+
 	// Start TCP listeners for tcp-type routes
 	s.startTCPListeners()
 
-	// Watch routes file for changes
-	go s.watchRoutes()
-
-	// Wait for signal
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-
+	// Stop the watcher before closing TCP listeners, preventing recreation.
+	watchCtx, cancelWatch := context.WithCancel(ctx)
+	watchDone := make(chan struct{})
+	go func() { defer close(watchDone); s.watchRoutes(watchCtx) }()
+	defer func() { cancelWatch(); <-watchDone }()
 	select {
-	case sig := <-sigCh:
-		log.Printf("received %v, shutting down...", sig)
+	case <-ctx.Done():
+		return nil
 	case err := <-errCh:
 		return err
 	}
 
-	if dnsServer != nil {
-		dnsServer.Stop()
-	}
-	return s.shutdown()
 }
 
 func (s *Server) shutdown() error {
@@ -499,11 +511,16 @@ func (s *Server) loadRoutes() error {
 }
 
 // watchRoutes polls the routes file for changes and reloads.
-func (s *Server) watchRoutes() {
+func (s *Server) watchRoutes(ctx context.Context) {
 	var lastMod time.Time
-
+	ticker := time.NewTicker(routePollInterval)
+	defer ticker.Stop()
 	for {
-		time.Sleep(routePollInterval)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 
 		info, err := os.Stat(s.routesFile)
 		if err != nil {
@@ -595,9 +612,51 @@ func stateFile(configDir string) string {
 	return filepath.Join(configDir, "proxy.state.json")
 }
 
-// WritePidFile writes the current process PID.
+// withMetadataLock serializes cooperating starters and cleanup. Never unlink
+// proxy.lock: a replacement inode would allow two independent lock holders.
+func withMetadataLock(configDir string, fn func() error) error {
+	f, err := os.OpenFile(filepath.Join(configDir, "proxy.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	return fn()
+}
+
+// WritePidFile refuses to overwrite any live owner's metadata.
 func WritePidFile(configDir string) error {
+	return withMetadataLock(configDir, func() error {
+		if pid := ReadPid(configDir); pid > 0 && processAlive(pid) {
+			return fmt.Errorf("proxy already running (pid %d)", pid)
+		}
+		return writeOwnPid(configDir)
+	})
+}
+
+func writeOwnPid(configDir string) error {
 	return os.WriteFile(PidFile(configDir), []byte(fmt.Sprintf("%d", os.Getpid())), 0600)
+}
+
+// ClaimState publishes state and PID under the metadata lock after HTTP binds.
+func ClaimState(configDir string, state ProxyState) error {
+	return withMetadataLock(configDir, func() error {
+		if pid := ReadPid(configDir); pid > 0 && processAlive(pid) {
+			return fmt.Errorf("proxy already running (pid %d)", pid)
+		}
+		state.PID = os.Getpid()
+		if err := WriteState(configDir, state); err != nil {
+			return err
+		}
+		if err := writeOwnPid(configDir); err != nil {
+			_ = os.Remove(stateFile(configDir))
+			return err
+		}
+		return nil
+	})
 }
 
 // WriteState writes the proxy state to disk.
@@ -633,10 +692,38 @@ func ReadPid(configDir string) int {
 	return pid
 }
 
-// RemovePidFile removes the PID file and state file.
-func RemovePidFile(configDir string) {
-	_ = os.Remove(PidFile(configDir))
-	_ = os.Remove(stateFile(configDir))
+// RemovePidFile removes only the captured owner's metadata, never a replacement.
+func RemovePidFile(configDir string, expectedPID int) {
+	if expectedPID <= 0 {
+		return
+	}
+	_ = withMetadataLock(configDir, func() error {
+		if ReadPid(configDir) != expectedPID {
+			return nil
+		}
+		if state := ReadState(configDir); state != nil && state.PID != expectedPID {
+			return nil
+		}
+		_ = os.Remove(stateFile(configDir))
+		return os.Remove(PidFile(configDir))
+	})
+}
+
+// Only ESRCH (or Go's equivalent) proves absence. Permission and unknown
+// probe errors fail closed, preserving ownership.
+func processExistsAfterSignal(err error) bool {
+	return !errors.Is(err, syscall.ESRCH) && !errors.Is(err, os.ErrProcessDone)
+}
+
+func processAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return processExistsAfterSignal(err)
+	}
+	return processExistsAfterSignal(proc.Signal(syscall.Signal(0)))
 }
 
 // IsRunning checks if the proxy is reachable on its HTTP port.
@@ -645,10 +732,5 @@ func IsRunning(configDir string) bool {
 	if pid == 0 {
 		return false
 	}
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	// Signal 0 checks if process exists
-	return proc.Signal(syscall.Signal(0)) == nil
+	return processAlive(pid)
 }

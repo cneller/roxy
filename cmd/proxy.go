@@ -1,10 +1,13 @@
 package cmd
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -119,24 +122,26 @@ func ProxyRun(opts ProxyOptions) error {
 		RoutesFile: paths.RoutesFile,
 	})
 
-	if err := proxy.WritePidFile(paths.ConfigDir); err != nil {
-		return fmt.Errorf("failed to write pid file: %w", err)
-	}
-	defer proxy.RemovePidFile(paths.ConfigDir)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	claimed := false
+	defer func() {
+		if claimed {
+			proxy.RemovePidFile(paths.ConfigDir, os.Getpid())
+		}
+	}()
+	return srv.RunContext(ctx, func() error {
+		if err := proxy.ClaimState(paths.ConfigDir, proxy.ProxyState{
+			HTTPPort: opts.HTTPPort, HTTPSPort: opts.HTTPSPort,
+			DNSPort: opts.DNSPort, TLS: opts.TLS,
+		}); err != nil {
+			return fmt.Errorf("failed to claim proxy metadata: %w", err)
+		}
+		claimed = true
+		printProxyStatus(opts)
+		return nil
+	})
 
-	if err := proxy.WriteState(paths.ConfigDir, proxy.ProxyState{
-		PID:       os.Getpid(),
-		HTTPPort:  opts.HTTPPort,
-		HTTPSPort: opts.HTTPSPort,
-		DNSPort:   opts.DNSPort,
-		TLS:       opts.TLS,
-	}); err != nil {
-		return fmt.Errorf("failed to write proxy state: %w", err)
-	}
-
-	printProxyStatus(opts)
-
-	return srv.Run()
 }
 
 // ProxyStop stops the proxy daemon.
@@ -150,20 +155,42 @@ func ProxyStop() error {
 		return nil
 	}
 
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		proxy.RemovePidFile(paths.ConfigDir)
-		return fmt.Errorf("process not found: %w", err)
+	if err := stopProxyProcess(paths.ConfigDir, pid, func(pid int, sig syscall.Signal) error {
+		proc, err := os.FindProcess(pid)
+		if err != nil {
+			return err
+		}
+		return proc.Signal(sig)
+	}, time.Sleep); err != nil {
+		return err
 	}
 
-	if err := proc.Signal(syscall.SIGTERM); err != nil {
-		proxy.RemovePidFile(paths.ConfigDir)
-		return fmt.Errorf("failed to stop proxy: %w", err)
-	}
-
-	proxy.RemovePidFile(paths.ConfigDir)
 	fmt.Println("proxy stopped")
 	return nil
+}
+
+// stopProxyProcess waits for actual exit, not merely signal delivery.
+// Injected probes keep regression tests from signaling a real proxy.
+func stopProxyProcess(configDir string, pid int, send func(int, syscall.Signal) error, sleep func(time.Duration)) error {
+	if err := send(pid, syscall.SIGTERM); err != nil {
+		if errors.Is(err, syscall.ESRCH) || errors.Is(err, os.ErrProcessDone) {
+			proxy.RemovePidFile(configDir, pid)
+			return nil
+		}
+		return fmt.Errorf("failed to stop proxy: %w", err)
+	}
+	for range proxy.ProxyStartRetries {
+		err := send(pid, syscall.Signal(0))
+		if errors.Is(err, syscall.ESRCH) || errors.Is(err, os.ErrProcessDone) {
+			proxy.RemovePidFile(configDir, pid)
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("cannot verify proxy exit: %w", err)
+		}
+		sleep(proxy.ProxyStartRetryInterval)
+	}
+	return fmt.Errorf("proxy pid %d has not exited; metadata retained", pid)
 }
 
 // ProxyRestart stops the running proxy (if any) and starts a new one.
