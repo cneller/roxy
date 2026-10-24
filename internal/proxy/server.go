@@ -633,10 +633,27 @@ func ReadPid(configDir string) int {
 	return pid
 }
 
-// RemovePidFile removes the PID file and state file.
+// RemovePidFile removes the PID file and state file when they belong to this
+// process. It leaves them in place when they name a different process that is
+// still alive: a failed `roxy proxy start` exits through this function, and
+// deleting a pidfile another live proxy wrote takes that proxy down with it.
+// A file naming a dead process, or no process, is stale and is removed.
 func RemovePidFile(configDir string) {
+	pid := ReadPid(configDir)
+	if pid != 0 && pid != os.Getpid() && processAlive(pid) {
+		return
+	}
 	_ = os.Remove(PidFile(configDir))
 	_ = os.Remove(stateFile(configDir))
+}
+
+// processAlive reports whether pid names a running process.
+func processAlive(pid int) bool {
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	return proc.Signal(syscall.Signal(0)) == nil
 }
 
 // IsRunning checks if the proxy is reachable on its HTTP port.
@@ -645,10 +662,5 @@ func IsRunning(configDir string) bool {
 	if pid == 0 {
 		return false
 	}
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	// Signal 0 checks if process exists
-	return proc.Signal(syscall.Signal(0)) == nil
+	return processAlive(pid)
 }
